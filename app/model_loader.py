@@ -1,157 +1,322 @@
-import tensorflow as tf
-from tensorflow.keras.models import model_from_json, load_model
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+# app/model_loader.py
+
+# YOLO 로드를 위해 유지 (필요 시 tf.io.gfile로 대체 가능)
+from tensorflow.keras.layers import TFSMLayer
+from tensorflow.keras import Model, Input
+from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.preprocessing import image
-from tensorflow.keras.mixed_precision import Policy
-from tensorflow.keras import Model
-import numpy as np
-import json
-import base64
-from io import BytesIO
+import tensorflow as tf
+import os
 from pathlib import Path
+import numpy as np
+import cv2
 
-# --- 설정값 ---
+# ultralytics YOLO import (환경에 따라 설치되어 있어야 함)
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None  # 로드 시점에 오류가 나면 startup에서 잡을 예정
+
 CLASS_NAMES = [
-    "관음죽", "금전수", "디펜바키아", "드라세나", "몬스테라",
-    "벵갈고무나무", "산세베리아", "스킨답서스", "수채화고무나무", "셀렘",
-    "아레카야자", "아이비", "여인초", "테이블야자", "필로덴드론"
+    "관음죽", "금전수", "디펜바키아","몬스테라","벵갈고무나무","보스턴고사리",'부레옥잠',
+    '선인장', '스투키', '스파티필럼', '오렌지쟈스민', '올리브나무', '테이블야자', '호접란', '홍콩야자'
 ]
-IMG_SIZE = 299  # 모델 입력 크기
-CONFIDENCE_THRESHOLD = 0.85
+IMG_SIZE = 299  # 학습된 모델 입력 크기 유지
+CONFIDENCE_THRESHOLD = 0.05  # 테스트용 낮춤, 추후 조정 가능
 
-# --- DTypePolicy 에러 대응 ---
-DTypePolicy = Policy
 
-# ---------------------
-# 모델 구조 생성 (MobileNetV2 기반)
-# ---------------------
-def create_model(num_classes=len(CLASS_NAMES), input_shape=(IMG_SIZE, IMG_SIZE, 3)):
-    base = tf.keras.applications.MobileNetV2(
-        include_top=False,
-        input_shape=input_shape,
-        weights=None,           # 나중에 load_weights 사용
-        pooling='avg'           # GlobalAveragePooling2D 적용
-    )
-    outputs = Dense(num_classes, activation='softmax', name='predictions')(base.output)
-    model = Model(inputs=base.input, outputs=outputs)
-    return model
+# ——————————
+# 모델 로드 (SavedModel에 맞게 수정)
+# ——————————
+def load_plant_model(model_path: str):
+    """SavedModel 폴더를 TFSMLayer로 래핑해 Keras 모델로 반환.
+       - SavedModel의 input name과 shape을 자동으로 읽어 사용.
+       - call_endpoint는 'serving_default'를 기본으로 시도.
+       - 실패 시 concrete function을 직접 호출하는 WrapperModel을 반환.
+    """
+    if not tf.io.gfile.isdir(model_path) and not os.path.isfile(model_path):
+        raise FileNotFoundError(f"모델 경로가 폴더가 아니거나 존재하지 않음: {model_path}")
 
-# ---------------------
-# h5 파일 안전 로드
-# ---------------------
-def load_plant_model_from_h5(h5_path: str):
-    from tensorflow.keras.models import load_model
-    from tensorflow.keras import Model
-    import tensorflow as tf
+    print(f"[INFO] 분류 모델 로드 시도: {model_path}")
 
-    h5_path = Path(h5_path)
-    if not h5_path.exists():
-        raise FileNotFoundError(f"h5 파일이 존재하지 않음: {h5_path}")
+    # 1) 먼저 파일(.h5/.keras)이면 기존 load_model 사용
+    if os.path.isfile(model_path):
+        print(f"[INFO] 분류 모델 파일 로드 시도 (파일): {model_path}")
+        return load_model(model_path, compile=False)
 
-    # 전체 모델 로드는 건너뛰고 weights-only로 바로 처리
-    model = create_model()  # create_model()에서 MobileNetV2 구조 정의
     try:
-        model.load_weights(h5_path, by_name=True)  # 레이어 이름 기준으로 로드
-        print(f"[INFO] weights-only 로드 성공: {h5_path}")
-        return model
+        # 2) SavedModel 로드(서명 확인)
+        loaded = tf.saved_model.load(model_path)
+        signatures = getattr(loaded, "signatures", None)
+        call_endpoint = "serving_default"
+        concrete_fn = None
+
+        if isinstance(signatures, dict) and call_endpoint in signatures:
+            concrete_fn = signatures[call_endpoint]
+        else:
+            # 대체 시도: loaded.signatures가 dict가 아닐 수 있음
+            try:
+                if hasattr(loaded, "signatures") and isinstance(loaded.signatures, dict):
+                    concrete_fn = loaded.signatures.get(call_endpoint)
+            except Exception:
+                concrete_fn = None
+
+        # Try to get any available concrete function if serving_default missing
+        if concrete_fn is None:
+            # check attributes for ConcreteFunction
+            try:
+                for attr_name in dir(loaded):
+                    attr = getattr(loaded, attr_name)
+                    # tf.types.experimental.ConcreteFunction check via duck-typing
+                    if hasattr(attr, "structured_input_signature"):
+                        # assume this is a candidate
+                        concrete_fn = attr
+                        break
+            except Exception:
+                concrete_fn = None
+
+        # If we still don't have concrete function, leave as None - we'll fallback later
+        input_name = None
+        input_shape = None
+
+        try:
+            if concrete_fn is not None:
+                sig = concrete_fn.structured_input_signature
+                _, kwargs = sig
+                if isinstance(kwargs, dict) and len(kwargs) > 0:
+                    input_name, spec = next(iter(kwargs.items()))
+                    # TensorSpec.shape -> TensorShape
+                    try:
+                        input_shape = spec.shape.as_list()
+                    except Exception:
+                        # fallback: try to read .shape directly
+                        input_shape = list(spec.shape)
+        except Exception as e:
+            print(f"[WARN] signatures 검사 중 문제: {e}")
+
+        # If we couldn't infer input_name/shape, try a conservative default (use 299 used during training)
+        if input_name is None or input_shape is None:
+            print("[WARN] SavedModel에서 input signature를 못 찾았습니다. 기본값 사용: name='input_layer_1', shape=(None,299,299,3)")
+            input_name = "input_layer_1"
+            input_shape = [None, 299, 299, 3]
+
+        # Normalize shape and extract spatial dims
+        # input_shape is like [None, H, W, C] — we only need H and W
+        try:
+            _, H, W, C = input_shape
+        except Exception:
+            # fallback to defaults
+            H, W, C = IMG_SIZE, IMG_SIZE, 3
+
+        print(f"[INFO] Detected SavedModel input -> name: '{input_name}', shape: (None,{H},{W},{C})")
+
+        # Create TFSMLayer and build a Keras wrapper that respects input name and shape
+        tfsm_layer = TFSMLayer(model_path, call_endpoint=call_endpoint)
+
+        # Create a Keras Input with the same name and shape (exclude batch dim)
+        inp = Input(shape=(H, W, C), name=input_name)
+
+        # Try multiple call styles: keyword, positional. If TFSMLayer fails, fallback to direct concrete_fn wrapper.
+        model = None
+        errors = []
+
+        # 1) Try keyword call using detected input_name
+        try:
+            out = tfsm_layer(**{input_name: inp})
+            model = Model(inputs=inp, outputs=out)
+            print("[INFO] SavedModel -> TFSMLayer 래핑 성공 (keyword by detected name)")
+            return model
+        except Exception as e:
+            errors.append(("kw_detected_name", e))
+            print(f"[WARN] TFSMLayer keyword({input_name}) 호출 실패: {e}")
+
+        # 2) If concrete_fn exists, inspect its structured_input_signature to find the actual key (like 'inputs')
+        sig_key = None
+        try:
+            if concrete_fn is not None:
+                _, kw = concrete_fn.structured_input_signature
+                if isinstance(kw, dict) and len(kw) > 0:
+                    # prefer common 'inputs' if present
+                    if "inputs" in kw:
+                        sig_key = "inputs"
+                    else:
+                        sig_key = next(iter(kw.keys()))
+                    print(f"[INFO] concrete_fn expects input key '{sig_key}'")
+        except Exception as e:
+            print(f"[WARN] concrete_fn 서명 검사 실패: {e}")
+
+        # 3) Try keyword call using signature key if different
+        if sig_key and sig_key != input_name:
+            try:
+                out = tfsm_layer(**{sig_key: inp})
+                model = Model(inputs=inp, outputs=out)
+                print(f"[INFO] SavedModel -> TFSMLayer 래핑 성공 (keyword by signature key '{sig_key}')")
+                return model
+            except Exception as e:
+                errors.append(("kw_sig_key", e))
+                print(f"[WARN] TFSMLayer keyword({sig_key}) 호출 실패: {e}")
+
+        # 4) Try positional call (some TFSMLayer variants accept positional)
+        try:
+            out = tfsm_layer(inp)
+            model = Model(inputs=inp, outputs=out)
+            print("[INFO] SavedModel -> TFSMLayer 래핑 성공 (positional)")
+            return model
+        except Exception as e:
+            errors.append(("positional", e))
+            print(f"[WARN] TFSMLayer positional 호출 실패: {e}")
+
+        # 5) LAST RESORT: use the concrete function directly and return a lightweight wrapper object
+        if concrete_fn is not None:
+            print("[WARN] TFSMLayer 호출이 모두 실패했습니다. concrete_fn을 직접 호출하는 WrapperModel을 반환합니다.")
+            # build a wrapper with predict() that calls concrete_fn with proper kwarg
+            class WrapperModel:
+                def __init__(self, concrete_fn, input_name_candidate):
+                    self._fn = concrete_fn
+                    self._input_names = []
+                    try:
+                        _, kw = self._fn.structured_input_signature
+                        if isinstance(kw, dict):
+                            self._input_names = list(kw.keys())
+                    except Exception:
+                        self._input_names = [input_name_candidate]
+
+                def predict(self, x, verbose=0):
+                    # ensure tensor
+                    xt = tf.constant(x)
+                    # try candidate names in order
+                    last_err = None
+                    for name in self._input_names:
+                        try:
+                            result = self._fn(**{name: xt})
+                            # concrete fn returns dict of tensors; convert to numpy and return in Keras-like shape
+                            if isinstance(result, dict):
+                                v = list(result.values())[0]
+                                return v.numpy()
+                            else:
+                                return result.numpy()
+                        except Exception as e:
+                            last_err = e
+                            continue
+                    # last attempt: positional
+                    try:
+                        out = self._fn(xt)
+                        if isinstance(out, dict):
+                            return list(out.values())[0].numpy()
+                        else:
+                            return out.numpy()
+                    except Exception as e:
+                        raise RuntimeError("WrapperModel: concrete_fn 호출 실패. 마지막 오류: " + str(e)) from last_err
+
+            w = WrapperModel(concrete_fn, input_name)
+            print("[INFO] WrapperModel 준비 완료 — predict() 사용 가능 (concrete_fn 직접 호출)")
+            return w
+
+        # If we reach here, raise aggregated error for debugging
+        err_msgs = "\n".join([f"{k}: {v}" for k, v in errors])
+        raise RuntimeError(f"SavedModel -> TFSMLayer 래핑 실패 (모든 시도 실패)\n{err_msgs}")
+
     except Exception as e:
-        raise RuntimeError(f"weights-only 로드 실패: {e}")
+        print(f"❌ [FATAL] SavedModel 래핑 실패: {e}")
+        raise e
 
 
-# ---------------------
-# JSON 관련 유틸
-# ---------------------
-def _remove_keys_recursively(obj, keys_to_remove):
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            if k in keys_to_remove:
-                del obj[k]
-            else:
-                _remove_keys_recursively(obj[k], keys_to_remove)
-    elif isinstance(obj, list):
-        for item in obj:
-            _remove_keys_recursively(item, keys_to_remove)
+def load_yolo_model(pt_path: str):
+    """YOLO 모델 로드 (원본 유지)"""
+    pt_path = Path(pt_path)
+    if not pt_path.exists():
+        raise FileNotFoundError(f"YOLO 파일이 존재하지 않음: {pt_path}")
+    print(f"[INFO] YOLO 모델 로드 중: {pt_path}")
+    if YOLO is None:
+        raise RuntimeError("ultralytics YOLO 라이브러리가 설치되어 있지 않습니다.")
+    return YOLO(str(pt_path))
 
-def find_keys_in_json(obj, key_name, path=""):
-    found = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            cur_path = f"{path}/{k}"
-            if k == key_name:
-                found.append((cur_path, v))
-            found.extend(find_keys_in_json(v, key_name, cur_path))
-    elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            found.extend(find_keys_in_json(item, key_name, f"{path}[{idx}]"))
-    return found
 
-def clean_model_json_str(model_json_str: str, keys_to_remove=None) -> str:
-    if keys_to_remove is None:
-        keys_to_remove = ['synchronized']
-    parsed = json.loads(model_json_str)
-    _remove_keys_recursively(parsed, keys_to_remove)
-    return json.dumps(parsed)
+# ——————————
+# 이미지 전처리 (원본 유지)
+# ——————————
+def preprocess_image_pipeline(img_bytes: bytes, yolo_model):
+    """바이트 이미지를 받아 YOLO 탐지 후 MobileNetV2 입력 형태로 전처리"""
 
-# ---------------------
-# JSON 구조 + 가중치 로드
-# ---------------------
-def load_plant_model(config_path: str, weights_path: str):
-    custom_objects = {'DTypePolicy': DTypePolicy}
-    # 1. JSON 로드
-    with open(config_path, 'r', encoding='utf-8') as f:
-        raw_json = f.read()
+    # 1. 바이트 -> OpenCV 이미지(BGR)
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("이미지 디코딩 실패")
 
-    # 2. 문제 키 제거
-    cleaned_json = clean_model_json_str(raw_json, keys_to_remove=['synchronized'])
+    # 2. BGR -> RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h_img, w_img, _ = img_rgb.shape
 
-    # 3. 모델 구조 생성
-    try:
-        model = model_from_json(cleaned_json, custom_objects=custom_objects)
-    except Exception as e:
-        raise RuntimeError(f"model_from_json 실패: {e}")
+    # 3. YOLO 탐지
+    results = yolo_model(img_rgb, verbose=False)
+    boxes = results[0].boxes
 
-    # 4. 가중치 로드
-    try:
-        model.load_weights(weights_path)
-    except Exception as e:
-        raise RuntimeError(f"가중치 로드 실패: {e}")
+    # 4. ROI 크롭 + padding
+    if len(boxes) > 0:
+        box = boxes[0]
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        w, h = x2 - x1, y2 - y1
+        pad = 0.1
+        x1p, y1p = max(0, int(x1 - w*pad)), max(0, int(y1 - h*pad))
+        x2p, y2p = min(w_img, int(x2 + w*pad)), min(h_img, int(y2 + h*pad))
+        plant_img = img_rgb[y1p:y2p, x1p:x2p]
+        print(f"[INFO] 식물 탐지 성공! 좌표: {x1p},{y1p},{x2p},{y2p}")
+    else:
+        plant_img = img_rgb
+        print("[WARN] 식물 탐지 실패, 전체 이미지 사용")
 
-    print("[INFO] 모델 로드 완료")
-    return model
+    # 5. Resize + 배치 + preprocess
+    img_resized = cv2.resize(plant_img, (IMG_SIZE, IMG_SIZE))
+    img_batch = np.expand_dims(img_resized, axis=0)
+    # MobileNetV2의 학습 시 사용한 전처리 적용
+    processed_image = preprocess_input(img_batch)
 
-# ---------------------
-# 이미지 전처리
-# ---------------------
-def preprocess_image_from_base64(image_base64_string: str):
-    if not image_base64_string:
-        raise ValueError("이미지 문자열이 비어있습니다.")
-    img_data = base64.b64decode(image_base64_string)
-    img = image.load_img(BytesIO(img_data), target_size=(IMG_SIZE, IMG_SIZE))
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array.astype('float32'))
-    return img_array
+    return processed_image
 
-# ---------------------
-# 예측
-# ---------------------
+
+def preprocess_image_from_bytes(img_bytes: bytes, yolo_model=None):
+    """메인 API에서 호출하는 전처리 래퍼 함수 (원본 유지)"""
+    if yolo_model is None:
+        raise ValueError("YOLO 모델 인스턴스 필요")
+    return preprocess_image_pipeline(img_bytes, yolo_model)
+
+
+# ——————————
+# 예측 (원본 유지)
+# ——————————
 def predict_species(model: tf.keras.Model, processed_image) -> dict:
     if processed_image is None:
         raise ValueError("processed_image가 None입니다.")
-    predictions = model.predict(processed_image)
-    probs = tf.nn.softmax(predictions[0]).numpy()
+
+    predictions = model.predict(processed_image, verbose=0)
+
+    # dict 출력 처리
+    if isinstance(predictions, dict):
+        key = list(predictions.keys())[0]
+        probs = predictions[key]
+    else:
+        probs = predictions[0]
+
+    # Tensor -> numpy, 1차원 변환
+    if isinstance(probs, tf.Tensor):
+        probs = probs.numpy()
+    probs = probs.flatten()
+
     confidence = float(np.max(probs))
     predicted_index = int(np.argmax(probs))
-    species_name = CLASS_NAMES[predicted_index] if confidence >= CONFIDENCE_THRESHOLD else "unknown species"
+    species_name = CLASS_NAMES[predicted_index]
+
+    if confidence < CONFIDENCE_THRESHOLD:
+        species_name = "unknown species"
+
+    # Top-5
+    top5_idx = probs.argsort()[-5:][::-1]
+    top5 = [(int(i), CLASS_NAMES[int(i)], float(probs[int(i)])) for i in top5_idx]
+    print(f"[DEBUG] Top-5 예측: {top5}")
+
     return {
         "species": species_name,
         "confidence": round(confidence, 4),
         "index": predicted_index
     }
-def preprocess_image_from_bytes(img_bytes: bytes):
-    img = image.load_img(BytesIO(img_bytes), target_size=(IMG_SIZE, IMG_SIZE))
-    img_array = image.img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array.astype('float32'))
-    return img_array
