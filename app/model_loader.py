@@ -1,258 +1,317 @@
-# app/model_loader.py
+import os
+from pathlib import Path
+import traceback
 
-# YOLO 로드를 위해 유지 (필요 시 tf.io.gfile로 대체 가능)
+import numpy as np
+import cv2
+
+import tensorflow as tf
 from tensorflow.keras.layers import TFSMLayer
 from tensorflow.keras import Model, Input
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-import tensorflow as tf
-import os
-from pathlib import Path
-import numpy as np
-import cv2
 
-# ultralytics YOLO import (환경에 따라 설치되어 있어야 함)
+# ultralytics YOLO (환경에 설치되어 있어야 함)
 try:
     from ultralytics import YOLO
 except Exception:
-    YOLO = None  # 로드 시점에 오류가 나면 startup에서 잡을 예정
+    YOLO = None
 
 CLASS_NAMES = [
     "관음죽", "금전수", "디펜바키아","몬스테라","벵갈고무나무","보스턴고사리",'부레옥잠',
     '선인장', '스투키', '스파티필럼', '오렌지쟈스민', '올리브나무', '테이블야자', '호접란', '홍콩야자'
 ]
-IMG_SIZE = 299  # 학습된 모델 입력 크기 유지
-CONFIDENCE_THRESHOLD = 0.05  # 테스트용 낮춤, 추후 조정 가능
+
+IMG_SIZE = 299
+CONFIDENCE_THRESHOLD = 0.05
 
 
-# ——————————
-# 모델 로드 (SavedModel에 맞게 수정)
-# ——————————
+# ---------- helper: savedmodel signature/shape 추론 ----------
+def _infer_savedmodel_input_shape(model_path: str):
+    try:
+        loaded = tf.saved_model.load(model_path)
+    except Exception as e:
+        print(f"[WARN] tf.saved_model.load 실패: {e}")
+        return None
+
+    candidates = []
+    signatures = getattr(loaded, "signatures", None)
+    if isinstance(signatures, dict):
+        for k, fn in signatures.items():
+            try:
+                sig = fn.structured_input_signature
+                _, kw = sig
+                if isinstance(kw, dict):
+                    for name, spec in kw.items():
+                        try:
+                            shape = spec.shape.as_list()
+                        except Exception:
+                            try:
+                                shape = list(spec.shape)
+                            except Exception:
+                                shape = None
+                        if shape and len(shape) == 4:
+                            candidates.append((k, name, shape))
+            except Exception:
+                continue
+
+    try:
+        for attr_name in dir(loaded):
+            attr = getattr(loaded, attr_name)
+            if hasattr(attr, "structured_input_signature"):
+                try:
+                    sig = attr.structured_input_signature
+                    _, kw = sig
+                    if isinstance(kw, dict):
+                        for name, spec in kw.items():
+                            try:
+                                shape = spec.shape.as_list()
+                            except Exception:
+                                try:
+                                    shape = list(spec.shape)
+                                except Exception:
+                                    shape = None
+                            if shape and len(shape) == 4:
+                                candidates.append((attr_name, name, shape))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    for cand in candidates:
+        _, _, shape = cand
+        if len(shape) == 4:
+            if shape[1] is not None and shape[2] is not None:
+                H, W, C = shape[1], shape[2], shape[3]
+                if all(isinstance(x, int) and x > 0 for x in (H, W, C)):
+                    return (int(H), int(W), int(C))
+
+    for cand in candidates:
+        _, _, shape = cand
+        if len(shape) == 4:
+            maybe_H = shape[1] if shape[1] is not None else (shape[2] if shape[2] is not None else None)
+            maybe_W = shape[2] if shape[2] is not None else (shape[1] if shape[1] is not None else None)
+            C = shape[3] if shape[3] is not None else 3
+            if maybe_H and maybe_W:
+                return (int(maybe_H), int(maybe_W), int(C))
+    return None
+
+
+# ---------- load_plant_model: TFSMLayer / concrete_fn / loaded.__call__ 등 가능한 것 전부 시도 ----------
 def load_plant_model(model_path: str):
-    """SavedModel 폴더를 TFSMLayer로 래핑해 Keras 모델로 반환.
-       - SavedModel의 input name과 shape을 자동으로 읽어 사용.
-       - call_endpoint는 'serving_default'를 기본으로 시도.
-       - 실패 시 concrete function을 직접 호출하는 WrapperModel을 반환.
-    """
     if not tf.io.gfile.isdir(model_path) and not os.path.isfile(model_path):
         raise FileNotFoundError(f"모델 경로가 폴더가 아니거나 존재하지 않음: {model_path}")
 
     print(f"[INFO] 분류 모델 로드 시도: {model_path}")
 
-    # 1) 먼저 파일(.h5/.keras)이면 기존 load_model 사용
+    # 1) 파일(.h5) 먼저 시도
     if os.path.isfile(model_path):
-        print(f"[INFO] 분류 모델 파일 로드 시도 (파일): {model_path}")
-        return load_model(model_path, compile=False)
+        try:
+            m = load_model(model_path, compile=False)
+            try:
+                ishape = m.input_shape
+                if ishape and len(ishape) == 4:
+                    _, H, W, C = ishape
+                    m._expected_input_shape = (int(H), int(W), int(C))
+                else:
+                    m._expected_input_shape = None
+            except Exception:
+                m._expected_input_shape = None
+            # Keras model은 predict 메소드가 있으므로 _callable_fn는 None으로 두어도 됨
+            m._callable_fn = None
+            return m
+        except Exception as e:
+            print(f"[WARN] keras load_model 실패: {e}")
+            # proceed to SavedModel attempts
 
+    # 2) SavedModel 로드 시도
     try:
-        # 2) SavedModel 로드(서명 확인)
         loaded = tf.saved_model.load(model_path)
-        signatures = getattr(loaded, "signatures", None)
-        call_endpoint = "serving_default"
-        concrete_fn = None
+    except Exception as e:
+        print(f"[FATAL] tf.saved_model.load 실패: {e}")
+        raise
 
-        if isinstance(signatures, dict) and call_endpoint in signatures:
-            concrete_fn = signatures[call_endpoint]
-        else:
-            # 대체 시도: loaded.signatures가 dict가 아닐 수 있음
-            try:
-                if hasattr(loaded, "signatures") and isinstance(loaded.signatures, dict):
-                    concrete_fn = loaded.signatures.get(call_endpoint)
-            except Exception:
-                concrete_fn = None
+    # try signatures -> serving_default
+    signatures = getattr(loaded, "signatures", None)
+    concrete_fn = None
+    if isinstance(signatures, dict) and "serving_default" in signatures:
+        concrete_fn = signatures["serving_default"]
+    elif isinstance(signatures, dict) and len(signatures) > 0:
+        # pick the first signature as candidate
+        concrete_fn = next(iter(signatures.values()))
 
-        # Try to get any available concrete function if serving_default missing
-        if concrete_fn is None:
-            # check attributes for ConcreteFunction
-            try:
-                for attr_name in dir(loaded):
-                    attr = getattr(loaded, attr_name)
-                    # tf.types.experimental.ConcreteFunction check via duck-typing
-                    if hasattr(attr, "structured_input_signature"):
-                        # assume this is a candidate
-                        concrete_fn = attr
-                        break
-            except Exception:
-                concrete_fn = None
+    # if no signatures, try to find any attr with structured_input_signature
+    if concrete_fn is None:
+        for name in dir(loaded):
+            attr = getattr(loaded, name)
+            if hasattr(attr, "structured_input_signature"):
+                concrete_fn = attr
+                break
 
-        # If we still don't have concrete function, leave as None - we'll fallback later
-        input_name = None
-        input_shape = None
-
+    # infer input shape
+    inferred_shape = None
+    if concrete_fn is not None:
         try:
-            if concrete_fn is not None:
-                sig = concrete_fn.structured_input_signature
-                _, kwargs = sig
-                if isinstance(kwargs, dict) and len(kwargs) > 0:
-                    input_name, spec = next(iter(kwargs.items()))
-                    # TensorSpec.shape -> TensorShape
+            sig = concrete_fn.structured_input_signature
+            _, kw = sig
+            if isinstance(kw, dict) and len(kw) > 0:
+                for nm, spec in kw.items():
                     try:
-                        input_shape = spec.shape.as_list()
+                        shape = spec.shape.as_list()
                     except Exception:
-                        # fallback: try to read .shape directly
-                        input_shape = list(spec.shape)
-        except Exception as e:
-            print(f"[WARN] signatures 검사 중 문제: {e}")
-
-        # If we couldn't infer input_name/shape, try a conservative default (use 299 used during training)
-        if input_name is None or input_shape is None:
-            print("[WARN] SavedModel에서 input signature를 못 찾았습니다. 기본값 사용: name='input_layer_1', shape=(None,299,299,3)")
-            input_name = "input_layer_1"
-            input_shape = [None, 299, 299, 3]
-
-        # Normalize shape and extract spatial dims
-        # input_shape is like [None, H, W, C] — we only need H and W
-        try:
-            _, H, W, C = input_shape
+                        try:
+                            shape = list(spec.shape)
+                        except Exception:
+                            shape = None
+                    if shape and len(shape) == 4:
+                        H = shape[1]
+                        W = shape[2]
+                        C = shape[3] if len(shape) > 3 else 3
+                        if H is not None and W is not None:
+                            inferred_shape = (int(H), int(W), int(C))
+                            break
         except Exception:
-            # fallback to defaults
-            H, W, C = IMG_SIZE, IMG_SIZE, 3
+            inferred_shape = None
 
-        print(f"[INFO] Detected SavedModel input -> name: '{input_name}', shape: (None,{H},{W},{C})")
+    if inferred_shape is None:
+        inferred_shape = _infer_savedmodel_input_shape(model_path)
 
-        # Create TFSMLayer and build a Keras wrapper that respects input name and shape
-        tfsm_layer = TFSMLayer(model_path, call_endpoint=call_endpoint)
+    if inferred_shape is None:
+        print("[WARN] SavedModel에서 input signature를 못 찾았습니다. _expected_input_shape은 None으로 설정됩니다.")
+    else:
+        print(f"[INFO] Detected SavedModel input shape -> {inferred_shape}")
 
-        # Create a Keras Input with the same name and shape (exclude batch dim)
-        inp = Input(shape=(H, W, C), name=input_name)
+    # 3) TFSMLayer 시도 (원래 방식)
+    tfsm_layer = None
+    try:
+        tfsm_layer = TFSMLayer(model_path, call_endpoint="serving_default")
+    except Exception as e:
+        # TFSMLayer 생성 실패시 로그만 남김, 계속 진행
+        print(f"[WARN] TFSMLayer 생성 실패: {e}")
+        tfsm_layer = None
 
-        # Try multiple call styles: keyword, positional. If TFSMLayer fails, fallback to direct concrete_fn wrapper.
-        model = None
-        errors = []
-
-        # 1) Try keyword call using detected input_name
-        try:
-            out = tfsm_layer(**{input_name: inp})
-            model = Model(inputs=inp, outputs=out)
-            print("[INFO] SavedModel -> TFSMLayer 래핑 성공 (keyword by detected name)")
-            return model
-        except Exception as e:
-            errors.append(("kw_detected_name", e))
-            print(f"[WARN] TFSMLayer keyword({input_name}) 호출 실패: {e}")
-
-        # 2) If concrete_fn exists, inspect its structured_input_signature to find the actual key (like 'inputs')
-        sig_key = None
-        try:
-            if concrete_fn is not None:
-                _, kw = concrete_fn.structured_input_signature
-                if isinstance(kw, dict) and len(kw) > 0:
-                    # prefer common 'inputs' if present
-                    if "inputs" in kw:
-                        sig_key = "inputs"
-                    else:
-                        sig_key = next(iter(kw.keys()))
-                    print(f"[INFO] concrete_fn expects input key '{sig_key}'")
-        except Exception as e:
-            print(f"[WARN] concrete_fn 서명 검사 실패: {e}")
-
-        # 3) Try keyword call using signature key if different
-        if sig_key and sig_key != input_name:
-            try:
-                out = tfsm_layer(**{sig_key: inp})
-                model = Model(inputs=inp, outputs=out)
-                print(f"[INFO] SavedModel -> TFSMLayer 래핑 성공 (keyword by signature key '{sig_key}')")
-                return model
-            except Exception as e:
-                errors.append(("kw_sig_key", e))
-                print(f"[WARN] TFSMLayer keyword({sig_key}) 호출 실패: {e}")
-
-        # 4) Try positional call (some TFSMLayer variants accept positional)
+    if tfsm_layer is not None:
+        # build Input according to inferred shape (fallback IMG_SIZE)
+        input_h, input_w, input_c = (inferred_shape if inferred_shape is not None else (IMG_SIZE, IMG_SIZE, 3))
+        inp = Input(shape=(input_h, input_w, input_c), name="input_layer_1")
         try:
             out = tfsm_layer(inp)
             model = Model(inputs=inp, outputs=out)
-            print("[INFO] SavedModel -> TFSMLayer 래핑 성공 (positional)")
+            model._expected_input_shape = (int(input_h), int(input_w), int(input_c))
+            model._callable_fn = None  # Keras-like predict exists
+            print("[INFO] SavedModel -> TFSMLayer 래핑 성공")
             return model
         except Exception as e:
-            errors.append(("positional", e))
-            print(f"[WARN] TFSMLayer positional 호출 실패: {e}")
+            print(f"[WARN] TFSMLayer 래핑 실패: {e}")
+            # 계속
 
-        # 5) LAST RESORT: use the concrete function directly and return a lightweight wrapper object
-        if concrete_fn is not None:
-            print("[WARN] TFSMLayer 호출이 모두 실패했습니다. concrete_fn을 직접 호출하는 WrapperModel을 반환합니다.")
-            # build a wrapper with predict() that calls concrete_fn with proper kwarg
-            class WrapperModel:
-                def __init__(self, concrete_fn, input_name_candidate):
-                    self._fn = concrete_fn
-                    self._input_names = []
-                    try:
-                        _, kw = self._fn.structured_input_signature
-                        if isinstance(kw, dict):
-                            self._input_names = list(kw.keys())
-                    except Exception:
-                        self._input_names = [input_name_candidate]
+    # 4) concrete_fn이 있으면 그것으로 wrapper 생성
+    if concrete_fn is not None:
+        # try to extract input names
+        input_names = []
+        try:
+            _, kw = concrete_fn.structured_input_signature
+            if isinstance(kw, dict):
+                input_names = list(kw.keys())
+        except Exception:
+            input_names = []
 
-                def predict(self, x, verbose=0):
-                    # ensure tensor
-                    xt = tf.constant(x)
-                    # try candidate names in order
-                    last_err = None
-                    for name in self._input_names:
-                        try:
-                            result = self._fn(**{name: xt})
-                            # concrete fn returns dict of tensors; convert to numpy and return in Keras-like shape
-                            if isinstance(result, dict):
-                                v = list(result.values())[0]
-                                return v.numpy()
-                            else:
-                                return result.numpy()
-                        except Exception as e:
-                            last_err = e
-                            continue
-                    # last attempt: positional
+        class SavedModelWrapper:
+            def __init__(self, fn, inferred_shape, input_names):
+                self._fn = fn
+                self._expected_input_shape = tuple(inferred_shape) if inferred_shape is not None else None
+                self._input_names = input_names
+
+            def predict(self, x, verbose=0):
+                # x: numpy array batch
+                xt = tf.constant(x)
+                last_err = None
+                # try keyword with input names
+                for name in self._input_names:
                     try:
-                        out = self._fn(xt)
-                        if isinstance(out, dict):
-                            return list(out.values())[0].numpy()
+                        res = self._fn(**{name: xt})
+                        if isinstance(res, dict):
+                            return list(res.values())[0].numpy()
                         else:
-                            return out.numpy()
+                            return res.numpy()
                     except Exception as e:
-                        raise RuntimeError("WrapperModel: concrete_fn 호출 실패. 마지막 오류: " + str(e)) from last_err
+                        last_err = e
+                        continue
+                # try positional
+                try:
+                    res = self._fn(xt)
+                    if isinstance(res, dict):
+                        return list(res.values())[0].numpy()
+                    else:
+                        return res.numpy()
+                except Exception as e:
+                    raise RuntimeError("SavedModelWrapper: 모든 호출 방식 실패: " + str(e)) from last_err
 
-            w = WrapperModel(concrete_fn, input_name)
-            print("[INFO] WrapperModel 준비 완료 — predict() 사용 가능 (concrete_fn 직접 호출)")
-            return w
+        wrapper = SavedModelWrapper(concrete_fn, inferred_shape, input_names)
+        wrapper._callable_fn = None
+        print("[INFO] SavedModel -> WrapperModel(ConcreteFunction) 준비")
+        return wrapper
 
-        # If we reach here, raise aggregated error for debugging
-        err_msgs = "\n".join([f"{k}: {v}" for k, v in errors])
-        raise RuntimeError(f"SavedModel -> TFSMLayer 래핑 실패 (모든 시도 실패)\n{err_msgs}")
+    # 5) 마지막 시도: loaded 객체 자체가 callable (일부 경우 가능)
+    try:
+        if callable(loaded):
+            class DirectWrapper:
+                def __init__(self, mod, inferred_shape):
+                    self._mod = mod
+                    self._expected_input_shape = tuple(inferred_shape) if inferred_shape is not None else None
+                def predict(self, x, verbose=0):
+                    xt = tf.constant(x)
+                    try:
+                        res = self._mod(xt)
+                        if isinstance(res, dict):
+                            return list(res.values())[0].numpy()
+                        else:
+                            return res.numpy()
+                    except Exception as e:
+                        raise RuntimeError("Direct loaded(...) 호출 실패: " + str(e))
+            dw = DirectWrapper(loaded, inferred_shape)
+            print("[INFO] loaded 모듈 자체가 callable하여 DirectWrapper 준비")
+            return dw
+    except Exception:
+        pass
 
-    except Exception as e:
-        print(f"❌ [FATAL] SavedModel 래핑 실패: {e}")
-        raise e
+    # 실패
+    raise RuntimeError("SavedModelWrapper: 내부 호출 가능한 serving function이나 call 가능 멤버를 찾을 수 없습니다. " +
+                       "모델에 'serving_default' signature가 없거나 호출 방식이 특이합니다.")
 
 
+# ---------- YOLO 로드 ----------
 def load_yolo_model(pt_path: str):
-    """YOLO 모델 로드 (원본 유지)"""
     pt_path = Path(pt_path)
     if not pt_path.exists():
         raise FileNotFoundError(f"YOLO 파일이 존재하지 않음: {pt_path}")
-    print(f"[INFO] YOLO 모델 로드 중: {pt_path}")
     if YOLO is None:
         raise RuntimeError("ultralytics YOLO 라이브러리가 설치되어 있지 않습니다.")
+    print(f"[INFO] YOLO 모델 로드 중: {pt_path}")
     return YOLO(str(pt_path))
 
 
-# ——————————
-# 이미지 전처리 (원본 유지)
-# ——————————
-def preprocess_image_pipeline(img_bytes: bytes, yolo_model):
-    """바이트 이미지를 받아 YOLO 탐지 후 MobileNetV2 입력 형태로 전처리"""
+# ---------- 전처리 (target_model의 expected shape 우선 사용) ----------
+def preprocess_image_pipeline(img_bytes: bytes, yolo_model, img_size: int = IMG_SIZE, target_model=None):
+    if target_model is not None:
+        try:
+            exp = getattr(target_model, "_expected_input_shape", None)
+            if exp is not None and isinstance(exp, (tuple, list)) and len(exp) >= 2:
+                img_size = int(exp[0])
+        except Exception:
+            pass
 
-    # 1. 바이트 -> OpenCV 이미지(BGR)
     nparr = np.frombuffer(img_bytes, np.uint8)
     img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise ValueError("이미지 디코딩 실패")
 
-    # 2. BGR -> RGB
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     h_img, w_img, _ = img_rgb.shape
 
-    # 3. YOLO 탐지
     results = yolo_model(img_rgb, verbose=False)
     boxes = results[0].boxes
 
-    # 4. ROI 크롭 + padding
     if len(boxes) > 0:
         box = boxes[0]
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
@@ -266,55 +325,127 @@ def preprocess_image_pipeline(img_bytes: bytes, yolo_model):
         plant_img = img_rgb
         print("[WARN] 식물 탐지 실패, 전체 이미지 사용")
 
-    # 5. Resize + 배치 + preprocess
-    img_resized = cv2.resize(plant_img, (IMG_SIZE, IMG_SIZE))
+    img_resized = cv2.resize(plant_img, (img_size, img_size))
     img_batch = np.expand_dims(img_resized, axis=0)
-    # MobileNetV2의 학습 시 사용한 전처리 적용
     processed_image = preprocess_input(img_batch)
-
     return processed_image
 
 
-def preprocess_image_from_bytes(img_bytes: bytes, yolo_model=None):
-    """메인 API에서 호출하는 전처리 래퍼 함수 (원본 유지)"""
+def preprocess_image_from_bytes(img_bytes: bytes, yolo_model=None, img_size: int = IMG_SIZE, target_model=None):
     if yolo_model is None:
         raise ValueError("YOLO 모델 인스턴스 필요")
-    return preprocess_image_pipeline(img_bytes, yolo_model)
+
+    # target_model의 expected_input_shape 확인
+    if target_model is not None:
+        exp = getattr(target_model, "_expected_input_shape", None)
+        if exp is not None and len(exp) == 3:
+            img_size = exp[0]  # H == W 가 동일하다고 가정
+
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("이미지 디코딩 실패")
+
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h_img, w_img, _ = img_rgb.shape
+
+    # YOLO로 식물 영역 crop
+    results = yolo_model(img_rgb, verbose=False)
+    boxes = results[0].boxes
+    if len(boxes) > 0:
+        box = boxes[0]
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        w, h = x2 - x1, y2 - y1
+        pad = 0.1
+        x1p, y1p = max(0, int(x1 - w*pad)), max(0, int(y1 - h*pad))
+        x2p, y2p = min(w_img, int(x2 + w*pad)), min(h_img, int(y2 + h*pad))
+        plant_img = img_rgb[y1p:y2p, x1p:x2p]
+        print(f"[INFO] 식물 탐지 성공! 좌표: {x1p},{y1p},{x2p},{y2p}")
+    else:
+        plant_img = img_rgb
+        print("[WARN] 식물 탐지 실패, 전체 이미지 사용")
+
+    img_resized = cv2.resize(plant_img, (img_size, img_size))
+    img_batch = np.expand_dims(img_resized, axis=0)
+    processed_image = preprocess_input(img_batch)
+    return processed_image
 
 
-# ——————————
-# 예측 (원본 유지)
-# ——————————
-def predict_species(model: tf.keras.Model, processed_image) -> dict:
-
+# ---------- predict_species: 다양한 model 타입 지원 ----------
+def predict_species(model, processed_image) -> dict:
     if processed_image is None:
         raise ValueError("processed_image가 None입니다.")
 
-    # 예측 수행
-    predictions = model.predict(processed_image, verbose=0)
+    # Try Keras-style predict
+    preds = None
+    last_err = None
+    try:
+        if hasattr(model, "predict"):
+            preds = model.predict(processed_image, verbose=0)
+            # print debug
+            print("[DEBUG] model.predict 사용 (hasattr predict)")
+    except Exception as e:
+        last_err = e
+        print(f"[WARN] model.predict 호출 실패: {e}")
 
-    # dict 출력 처리
-    if isinstance(predictions, dict):
-        key = list(predictions.keys())[0]
-        probs = predictions[key]
+    # If not obtained, try wrapper _callable_fn or model as callable
+    if preds is None:
+        # If wrapper stored a concrete function, try it
+        try:
+            # model might be a wrapper with _fn or be callable
+            if hasattr(model, "_fn"):
+                fn = getattr(model, "_fn")
+                try:
+                    res = fn(processed_image)
+                    preds = res
+                except Exception:
+                    # try with tf.constant
+                    res = fn(tf.constant(processed_image))
+                    preds = res
+            elif hasattr(model, "_callable_fn") and model._callable_fn is not None:
+                fn = model._callable_fn
+                res = fn(processed_image)
+                preds = res
+            elif callable(model):
+                # some wrappers return numpy if passed np array, some expect tf.Tensor
+                try:
+                    res = model(processed_image)
+                    preds = res
+                except Exception:
+                    res = model(tf.constant(processed_image))
+                    preds = res
+            else:
+                raise RuntimeError("모델에 대해 시도할 수 있는 호출 방식이 없습니다.")
+        except Exception as e:
+            print(f"[ERROR] 대체 호출 방식 실패: {e}")
+            # raise the original failure to surface the root cause
+            raise RuntimeError(f"model.predict 실패: {last_err or e}") from (last_err or e)
+
+    # Normalize preds to probability vector
+    if isinstance(preds, dict):
+        key = list(preds.keys())[0]
+        probs = preds[key]
     else:
-        probs = predictions[0]
+        # preds could be tf.Tensor or numpy array; if shape is (1, n) or (batch, n) choose first row
+        if isinstance(preds, tf.Tensor):
+            preds = preds.numpy()
+        preds = np.asarray(preds)
+        if preds.ndim == 1:
+            probs = preds
+        else:
+            probs = preds[0]
 
-    if isinstance(probs, tf.Tensor):
-        probs = probs.numpy()
-    probs = probs.flatten()
+    probs = np.asarray(probs).flatten()
 
-    # Top-5 후보 계산
     top5_idx = probs.argsort()[-5:][::-1]
     top5 = [(CLASS_NAMES[int(i)], float(probs[int(i)])) for i in top5_idx]
     print(f"[DEBUG] Top-5 예측: {top5}")
 
-    # 기본 Top-1
     predicted_index = int(top5_idx[0])
     species_name = CLASS_NAMES[predicted_index]
     confidence = float(probs[predicted_index])
 
-    # ——— Top-2 우선 선택 로직 ———
+    # Top-2 우선 logic (optional)
     target_class = "호접란"
     top2_idx = top5_idx[:2]
     forced_selection = False
@@ -328,14 +459,79 @@ def predict_species(model: tf.keras.Model, processed_image) -> dict:
             print(f"[DEBUG] Top-2 안에 '{target_class}' 발견, 우선 선택")
             break
 
-    # confidence 임계값 체크 (Top-2 우선 선택 시 제외)
-    CONFIDENCE_THRESHOLD = 0.05  # 필요 시 조정
     if not forced_selection and confidence < CONFIDENCE_THRESHOLD:
         species_name = "unknown species"
         print(f"[DEBUG] confidence {confidence:.4f} < {CONFIDENCE_THRESHOLD}, unknown 처리")
 
-    return {
-        "species": species_name,
-        "confidence": round(confidence, 4),
-        "index": predicted_index
-    }
+    return {"species": species_name, "confidence": round(confidence, 4), "index": predicted_index}
+
+
+# ---------- 진단 모델 로드/진단 ----------
+# 기존 load_plant_model에서 TFSMLayer 관련 제거 후, SavedModelWrapper만 사용
+def load_diagnosis_model(model_path: str):
+    if not tf.io.gfile.exists(model_path):
+        raise FileNotFoundError(f"모델 경로가 존재하지 않음: {model_path}")
+
+    print(f"[INFO] 진단 모델 로드 시도: {model_path}")
+
+    # SavedModel 로드
+    loaded = tf.saved_model.load(model_path)
+
+    # serving_default ConcreteFunction 강제 사용
+    if 'serving_default' not in loaded.signatures:
+        raise RuntimeError(f"진단 모델 로드 실패: {model_path} 내부에 'serving_default'가 없음")
+    concrete_fn = loaded.signatures['serving_default']
+
+    # 입력/출력 이름 명시
+    input_name = 'input_layer'   # CLI에서 확인된 입력 이름
+    output_name = 'output_0'     # CLI에서 확인된 출력 이름
+
+    # 입력 shape 추출
+    input_shape = (224, 224, 3)  # CLI에서 확인됨
+
+    # wrapper 생성
+    class SavedModelWrapper:
+        def __init__(self, fn, input_shape):
+            self._fn = fn
+            self._expected_input_shape = input_shape
+
+        def predict(self, x, verbose=0):
+            xt = tf.constant(x, dtype=tf.float32)
+            try:
+                res = self._fn(**{input_name: xt})
+                return res[output_name].numpy()
+            except Exception as e:
+                raise RuntimeError(f"SavedModelWrapper 호출 실패: {e}")
+
+    wrapper = SavedModelWrapper(concrete_fn, input_shape)
+    print(f"[INFO] 진단 모델 wrapper 준비, expected_input_shape={input_shape}")
+    return wrapper
+
+
+def diagnose_state(diagnosis_model, processed_image) -> dict:
+    if diagnosis_model is None:
+        raise ValueError("diagnosis_model이 없습니다.")
+
+    try:
+        if hasattr(diagnosis_model, "predict"):
+            preds = diagnosis_model.predict(processed_image, verbose=0)
+        else:
+            preds = diagnosis_model(tf.constant(processed_image))
+    except Exception as e:
+        raise RuntimeError(f"diagnosis_model.predict 실패: {e}")
+
+    if isinstance(preds, dict):
+        preds = list(preds.values())[0]
+    if isinstance(preds, tf.Tensor):
+        preds = preds.numpy()
+
+    probs = np.asarray(preds).squeeze()
+    if probs.ndim != 1:
+        probs = probs.flatten()
+
+    DIAG_STATUSES = ["DRY", "APPROPRIATE", "OVERWATERED"]
+    top_idx = int(np.argmax(probs))
+    status = DIAG_STATUSES[top_idx] if top_idx < len(DIAG_STATUSES) else "UNKNOWN"
+    confidence = float(probs[top_idx])
+
+    return {"status": status, "confidence": round(confidence, 4)}
