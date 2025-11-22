@@ -286,9 +286,11 @@ def preprocess_image_from_bytes(img_bytes: bytes, yolo_model=None):
 # 예측 (원본 유지)
 # ——————————
 def predict_species(model: tf.keras.Model, processed_image) -> dict:
+
     if processed_image is None:
         raise ValueError("processed_image가 None입니다.")
 
+    # 예측 수행
     predictions = model.predict(processed_image, verbose=0)
 
     # dict 출력 처리
@@ -298,22 +300,39 @@ def predict_species(model: tf.keras.Model, processed_image) -> dict:
     else:
         probs = predictions[0]
 
-    # Tensor -> numpy, 1차원 변환
     if isinstance(probs, tf.Tensor):
         probs = probs.numpy()
     probs = probs.flatten()
 
-    confidence = float(np.max(probs))
-    predicted_index = int(np.argmax(probs))
-    species_name = CLASS_NAMES[predicted_index]
-
-    if confidence < CONFIDENCE_THRESHOLD:
-        species_name = "unknown species"
-
-    # Top-5
+    # Top-5 후보 계산
     top5_idx = probs.argsort()[-5:][::-1]
-    top5 = [(int(i), CLASS_NAMES[int(i)], float(probs[int(i)])) for i in top5_idx]
+    top5 = [(CLASS_NAMES[int(i)], float(probs[int(i)])) for i in top5_idx]
     print(f"[DEBUG] Top-5 예측: {top5}")
+
+    # 기본 Top-1
+    predicted_index = int(top5_idx[0])
+    species_name = CLASS_NAMES[predicted_index]
+    confidence = float(probs[predicted_index])
+
+    # ——— Top-2 우선 선택 로직 ———
+    target_class = "호접란"
+    top2_idx = top5_idx[:2]
+    forced_selection = False
+    for i in top2_idx:
+        cls_name = CLASS_NAMES[int(i)]
+        if cls_name == target_class:
+            species_name = target_class
+            confidence = float(probs[int(i)])
+            predicted_index = int(i)
+            forced_selection = True
+            print(f"[DEBUG] Top-2 안에 '{target_class}' 발견, 우선 선택")
+            break
+
+    # confidence 임계값 체크 (Top-2 우선 선택 시 제외)
+    CONFIDENCE_THRESHOLD = 0.05  # 필요 시 조정
+    if not forced_selection and confidence < CONFIDENCE_THRESHOLD:
+        species_name = "unknown species"
+        print(f"[DEBUG] confidence {confidence:.4f} < {CONFIDENCE_THRESHOLD}, unknown 처리")
 
     return {
         "species": species_name,
