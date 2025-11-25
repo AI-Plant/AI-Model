@@ -1,3 +1,4 @@
+# app/model_loader.py
 import os
 from pathlib import Path
 import traceback
@@ -10,7 +11,8 @@ from tensorflow.keras.layers import TFSMLayer
 from tensorflow.keras import Model, Input
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-
+from pathlib import Path
+from ultralytics import YOLO
 # ultralytics YOLO (환경에 설치되어 있어야 함)
 try:
     from ultralytics import YOLO
@@ -447,7 +449,7 @@ def predict_species(model, processed_image) -> dict:
 
     # Top-2 우선 logic (optional)
     target_class = "호접란"
-    top2_idx = top5_idx[:2]
+    top2_idx = top5_idx[:1]
     forced_selection = False
     for i in top2_idx:
         cls_name = CLASS_NAMES[int(i)]
@@ -512,16 +514,27 @@ def diagnose_state(diagnosis_model, processed_image) -> dict:
     if diagnosis_model is None:
         raise ValueError("diagnosis_model이 없습니다.")
 
+    # --- 예측 실행 + 디버그 로그 + traceback 추가 ---
     try:
         if hasattr(diagnosis_model, "predict"):
             preds = diagnosis_model.predict(processed_image, verbose=0)
         else:
-            preds = diagnosis_model(tf.constant(processed_image))
+            serving_fn = diagnosis_model.signatures["serving_default"]
+            input_name = list(serving_fn.structured_input_signature[1].keys())[0]
+            preds = serving_fn(**{input_name: tf.constant(processed_image)})
     except Exception as e:
+        print("[DEBUG-DIAG] diagnosis_model 호출 실패, 예외 trace:")
+        import traceback
+        traceback.print_exc()
         raise RuntimeError(f"diagnosis_model.predict 실패: {e}")
 
+    # --- raw preds 디버그 출력 ---
+    print(f"[DEBUG-DIAG] raw preds type={type(preds)} shape(if array)={getattr(preds, 'shape', 'N/A')}")
+
+    # --- 예측 결과 후처리 ---
     if isinstance(preds, dict):
         preds = list(preds.values())[0]
+
     if isinstance(preds, tf.Tensor):
         preds = preds.numpy()
 
@@ -534,4 +547,108 @@ def diagnose_state(diagnosis_model, processed_image) -> dict:
     status = DIAG_STATUSES[top_idx] if top_idx < len(DIAG_STATUSES) else "UNKNOWN"
     confidence = float(probs[top_idx])
 
-    return {"status": status, "confidence": round(confidence, 4)}
+    return {
+        "status": status,
+        "confidence": round(confidence, 4)
+    }
+
+
+
+YOLO_SEARCH_ROOTS = [Path("yolo_log"), Path("saved_model") / "yolo_log"]
+
+def find_yolo_path_for_species(species: str) -> str | None:
+    """
+    species 이름이 포함된 yolo 로그 디렉토리에서 weights/best.pt 를 찾아 반환.
+    우선순위:
+      1) 경로에 'stage2' 또는 'stage2_' 포함된 파일 우선
+      2) 그 다음 'stage1'
+      3) 그 외 발견된 것 중 첫 번째
+      4) fallback saved_model/best1.pt
+    """
+    candidates = []
+    for root in YOLO_SEARCH_ROOTS:
+        if not root.exists():
+            continue
+        for p in root.iterdir():
+            try:
+                if species in p.name:
+                    # 직접 weights/best.pt 경로 체크
+                    w1 = p.joinpath("weights", "best.pt")
+                    if w1.exists():
+                        candidates.append(w1)
+                        continue
+                    # 내부 rglob로 best.pt 수집
+                    for cand in p.rglob("best.pt"):
+                        candidates.append(cand)
+            except Exception:
+                continue
+        # fallback: 전역적으로 best.pt 검색
+        for cand in root.rglob("best.pt"):
+            candidates.append(cand)
+
+    # 중복 제거 & 절대경로 문자열 기준 정렬 안정화
+    seen = set()
+    filtered = []
+    for c in candidates:
+        try:
+            s = str(c.resolve())
+        except Exception:
+            s = str(c)
+        if s not in seen:
+            seen.add(s)
+            filtered.append(Path(s))
+
+    if len(filtered) == 0:
+        fallback = Path("saved_model") / "best1.pt"
+        if fallback.exists():
+            return str(fallback)
+        return None
+
+    # 1) species 이름 포함 경로 우선 필터 (이미 대부분 후보는 포함되어 있음)
+    species_candidates = [c for c in filtered if species in str(c)]
+    pool = species_candidates if species_candidates else filtered
+
+    # 2) 우선순위로 정렬: stage2 > stage1 > others
+    def priority_score(p: Path):
+        s = str(p).lower()
+        if "stage2" in s or "stage_2" in s or "stage2_" in s or "1280" in s:
+            return 0
+        if "stage1" in s or "stage_1" in s or "960" in s:
+            return 1
+        # 약간 더 높은 점수는 낮은 우선순위
+        return 2
+
+    pool_sorted = sorted(pool, key=lambda p: (priority_score(p), len(str(p)), str(p)))
+
+    # (디버그) 발견된 후보 목록 로그 출력 (원하면 주석처리)
+    print(f"[DEBUG] find_yolo_path_for_species candidates for '{species}':")
+    for i, c in enumerate(pool_sorted):
+        print(f"  {i}: {c}")
+
+    # 최종 반환
+    return str(pool_sorted[0])
+
+
+
+# 캐시용 딕셔너리
+_yolo_cache = {}
+
+def load_yolo_model_for_species(species: str):
+    """
+    species에 맞는 YOLO 모델을 로드(캐시). 파일 못 찾으면 None 반환.
+    """
+    path = find_yolo_path_for_species(species)
+    if path is None:
+        print(f"[WARN] '{species}'용 YOLO 모델을 찾을 수 없습니다.")
+        return None
+    if path in _yolo_cache:
+        return _yolo_cache[path]
+    try:
+        print(f"[INFO] Trying to load YOLO from: {path}")
+        y = YOLO(path)
+        _yolo_cache[path] = y
+        print(f"[INFO] YOLO loaded for species={species}, path={path}")
+        return y
+    except Exception as e:
+        print(f"[WARN] YOLO load failed for {path}: {e}")
+        return None
