@@ -29,6 +29,6 @@ COPY app/ /app/app/
 # 6. 서버 실행 명령어
 EXPOSE 8000
 CMD ["gunicorn", "app.main:app", \
-      "--workers", "4", \
+      "--workers", "1", \
       "--worker-class", "uvicorn.workers.UvicornWorker", \
       "--bind", "0.0.0.0:8000"]
