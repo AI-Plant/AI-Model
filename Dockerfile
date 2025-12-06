@@ -20,7 +20,11 @@ WORKDIR /app
 
 # 3. Python 의존성 설치
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# (수정됨) 무거운 패키지 먼저, 타임아웃 시간 늘려서 설치 (1000초)
+RUN pip install --no-cache-dir --default-timeout=1000 torch==2.4.1 tensorflow==2.20.0
+
+# 나머지 패키지 설치
+RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
 
 # 4. 모델 파일 복사 (나머지 단계는 모두 동일)
 COPY saved_model/ /app/saved_model/
