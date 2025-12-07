@@ -38,7 +38,7 @@ after_success:
     if [ "$TRAVIS_BRANCH" == "main" ] && [ "$TRAVIS_PULL_REQUEST" == "false" ]; then
       echo "On main branch: Deploying to EC2..."
       
-      echo "$PRIVATE_KEY" > private_key.pem
+      echo "$PRIVATE_KEY" | base64 -d > private_key.pem
       chmod 600 private_key.pem
       
       ssh -o StrictHostKeyChecking=no -i private_key.pem $EC2_USER@$EC2_HOST "
