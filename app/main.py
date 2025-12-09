@@ -141,7 +141,7 @@ async def classify_plant(image: UploadFile = File(...)):
                             detail=f"이미지 처리 실패: {e}")
 
 
-@app.post("/diagnose", response_model=PlantDiagnosisResponse)
+@app.post("/diagnosee", response_model=PlantDiagnosisResponse)
 async def diagnose_plant(request: Request, image: UploadFile = File(...)):
     url_path = request.url.path.strip()
     if url_path != "/diagnose":
